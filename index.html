@@ -252,7 +252,7 @@
     }
     .card-row-b {
       display: flex; align-items: center;
-      justify-content: space-between; margin-bottom: .5rem;
+      justify-content: space-between;
     }
     .card-ticker {
       font-family: 'JetBrains Mono', monospace;
@@ -262,7 +262,6 @@
     .card-change { font-size: .73rem; font-weight: 500; white-space: nowrap; }
     .card-change.pos { color: var(--positive); }
     .card-change.neg { color: var(--negative); }
-    .mini-chart { height: 36px; }
 
     /* remove btn */
     .card-rm {
@@ -626,75 +625,122 @@ const cache = {};   // { SYMBOL: { quote, prices, dates, news, analysis } }
 let active  = null;
 let period  = 21;
 let chart   = null;
-const minis = {};
-let refreshTimer = null;
 
 function saveWL() { localStorage.setItem('sv_wl', JSON.stringify(watchlist)); }
 
 /* ═══════════════════════════════════════════════════════
-   YAHOO FINANCE FETCH
-   Tries direct → corsproxy.io → allorigins (fallback chain)
+   FINNHUB API
 ═══════════════════════════════════════════════════════ */
-const PROXIES = [
-  u => u,
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-];
+const API_KEY = 'd7if4d9r01qn2qatq0kgd7if4d9r01qn2qatq0l0';
+const FH_BASE = 'https://finnhub.io/api/v1';
 
-async function yf(url) {
-  let lastErr;
-  for (const make of PROXIES) {
-    try {
-      const r = await fetch(make(url));
-      if (!r.ok) throw new Error(r.status);
-      return await r.json();
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr;
+async function fh(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const r = await fetch(`${FH_BASE}${path}${sep}token=${API_KEY}`);
+  if (!r.ok) throw new Error(`Finnhub ${r.status}: ${path}`);
+  return await r.json();
 }
 
-/* ── Quote ── */
-async function fetchQuote(symbols) {
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols.join(',')}`
-    + `&fields=symbol,shortName,regularMarketPrice,regularMarketChange,`
-    + `regularMarketChangePercent,marketCap,trailingPE,regularMarketVolume,`
-    + `fiftyTwoWeekHigh,fiftyTwoWeekLow,regularMarketPreviousClose`;
-  const d = await yf(url);
-  return d.quoteResponse?.result || [];
+/* ── 即時報價 ── */
+async function fetchQuoteFH(symbol) {
+  // { c: price, d: change, dp: changePct, h: high, l: low, o: open, pc: prevClose, t: timestamp }
+  return await fh(`/quote?symbol=${symbol}`);
 }
 
-/* ── Chart (1Y daily) ── */
-async function fetchChart(symbol) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
-  const d = await yf(url);
+/* ── 公司資料 ── */
+async function fetchProfile(symbol) {
+  // { name, ticker, marketCapitalization (millions), exchange, finnhubIndustry, logo }
+  try { return await fh(`/stock/profile2?symbol=${symbol}`); }
+  catch { return {}; }
+}
+
+/* ── K 線 (1 年日線) — Yahoo Finance via CORS proxy ── */
+async function fetchWithTimeout(url, ms = 7000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(id);
+    return r;
+  } catch(e) { clearTimeout(id); throw e; }
+}
+
+function parseYahooChart(d) {
   const res = d.chart?.result?.[0];
-  if (!res) throw new Error('No chart data');
-  const closes = res.indicators.quote[0].close;
+  if (!res) return null;
+  const closes = res.indicators?.quote?.[0]?.close;
   const stamps  = res.timestamp;
-  const prices = [], dates = [];
+  if (!closes?.length || !stamps?.length) return null;
+  const c = [], t = [], h = [], l = [], v = [];
   closes.forEach((p, i) => {
     if (p != null) {
-      prices.push(+p.toFixed(2));
-      dates.push(new Date(stamps[i] * 1000));
+      c.push(+p.toFixed(2));
+      t.push(stamps[i]);
+      h.push(res.indicators.quote[0].high?.[i]   ?? p);
+      l.push(res.indicators.quote[0].low?.[i]    ?? p);
+      v.push(res.indicators.quote[0].volume?.[i] ?? 0);
     }
   });
-  return { prices, dates };
+  return c.length ? { c, t, h, l, v, s: 'ok' } : null;
 }
 
-/* ── News ── */
-async function fetchNews(symbol) {
+async function fetchCandles(symbol) {
+  const yUrl1 = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
+  const yUrl2 = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
+
+  const attempts = [
+    // 1. Direct (works in some browsers / environments)
+    () => fetchWithTimeout(yUrl1),
+    // 2. corsproxy.io with query1
+    () => fetchWithTimeout(`https://corsproxy.io/?${encodeURIComponent(yUrl1)}`),
+    // 3. corsproxy.io with query2
+    () => fetchWithTimeout(`https://corsproxy.io/?${encodeURIComponent(yUrl2)}`),
+    // 4. allorigins raw with query1
+    () => fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(yUrl1)}`),
+    // 5. allorigins raw with query2
+    () => fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(yUrl2)}`),
+    // 6. thingproxy
+    () => fetchWithTimeout(`https://thingproxy.freeboard.io/fetch/${yUrl1}`),
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const r = await attempt();
+      if (!r.ok) continue;
+      const d = await r.json();
+      const result = parseYahooChart(d);
+      if (result) return result;
+    } catch {}
+  }
+  throw new Error('無法取得歷史 K 線（所有代理均失敗）');
+}
+
+/* ── 基本財務指標 ── */
+async function fetchMetrics(symbol) {
   try {
-    const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${symbol}&quotesCount=0&newsCount=6`;
-    const d = await yf(url);
-    return (d.news || []).slice(0, 6);
+    const d = await fh(`/stock/metric?symbol=${symbol}&metric=all`);
+    return d.metric || {};
+  } catch { return {}; }
+}
+
+/* ── 公司新聞（近 7 天）── */
+async function fetchNewsFH(symbol) {
+  try {
+    const to   = new Date().toISOString().split('T')[0];
+    const from = new Date(Date.now() - 7*24*3600*1000).toISOString().split('T')[0];
+    // [{ headline, source, datetime, url, summary }]
+    const d = await fh(`/company-news?symbol=${symbol}&from=${from}&to=${to}`);
+    return Array.isArray(d) ? d.slice(0, 6) : [];
   } catch { return []; }
 }
 
-/* ── Search ── */
-async function searchYF(q) {
-  const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0&enableFuzzyQuery=true`;
-  const d = await yf(url);
-  return (d.quotes || []).filter(x => x.quoteType === 'EQUITY' || x.quoteType === 'ETF');
+/* ── 搜尋 ── */
+async function searchFH(q) {
+  // { result: [{ description, displaySymbol, symbol, type }] }
+  const d = await fh(`/search?q=${encodeURIComponent(q)}`);
+  return (d.result || []).filter(r =>
+    r.type === 'Common Stock' || r.type === 'ETP' || r.type === 'ADR'
+  ).slice(0, 8);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -807,36 +853,56 @@ function buildAnalysis(prices, quote) {
    DATA LOADING
 ═══════════════════════════════════════════════════════ */
 async function loadStock(sym) {
-  const [quotes, chartData, news] = await Promise.all([
-    fetchQuote([sym]),
-    fetchChart(sym),
-    fetchNews(sym),
+  const [quoteFH, profile, candles, metrics, news] = await Promise.all([
+    fetchQuoteFH(sym),
+    fetchProfile(sym),
+    fetchCandles(sym),
+    fetchMetrics(sym),
+    fetchNewsFH(sym),
   ]);
-  const quote = quotes[0];
-  if (!quote) throw new Error(`No data for ${sym}`);
+
+  if (candles.s !== 'ok' || !candles.c?.length) throw new Error(`No candle data: ${sym}`);
+
+  const prices = candles.c.map(p => +p.toFixed(2));
+  const dates  = candles.t.map(t => new Date(t * 1000));
+  const lastVol = candles.v?.[candles.v.length - 1] || 0;
+
+  // 統一格式（與渲染層解耦）
+  const quote = {
+    symbol:                    sym,
+    shortName:                 profile.name || sym,
+    regularMarketPrice:        quoteFH.c,
+    regularMarketChange:       quoteFH.d,
+    regularMarketChangePercent:quoteFH.dp,
+    regularMarketVolume:       lastVol,
+    marketCap:                 (profile.marketCapitalization || 0) * 1e6,
+    trailingPE:                metrics['peTTM'] || metrics['peNormalizedAnnual'] || null,
+    fiftyTwoWeekHigh:          metrics['52WeekHigh'] || Math.max(...(candles.h || prices)),
+    fiftyTwoWeekLow:           metrics['52WeekLow']  || Math.min(...(candles.l || prices)),
+    exchange:                  profile.exchange || '',
+  };
+
   cache[sym] = {
     quote,
-    prices: chartData.prices,
-    dates:  chartData.dates,
+    prices,
+    dates,
     news,
-    analysis: buildAnalysis(chartData.prices, quote),
+    analysis: buildAnalysis(prices, quote),
   };
 }
 
 async function loadAll() {
   if (watchlist.length === 0) return;
-  showMainLoading('載入持倉數據…');
+  showMainLoading('連接 Finnhub，載入即時數據…');
   try {
     await Promise.all(watchlist.map(s => loadStock(s).catch(e => {
       console.warn(`${s} failed:`, e);
-      toast(`⚠ ${s} 載入失敗，使用備用數據`, 'err');
+      toast(`⚠ ${s} 載入失敗：${e.message}`, 'err');
     })));
   } finally {
     hideMainLoading();
     renderSidebar();
-    if (!active) {
-      active = watchlist.find(s => cache[s]) || watchlist[0];
-    }
+    if (!active) active = watchlist.find(s => cache[s]) || watchlist[0];
     if (active && cache[active]) renderMain(active);
   }
 }
@@ -844,13 +910,18 @@ async function loadAll() {
 async function refreshQuotes() {
   if (watchlist.length === 0) return;
   try {
-    const quotes = await fetchQuote(watchlist);
-    quotes.forEach(q => {
-      if (cache[q.symbol]) {
-        cache[q.symbol].quote    = q;
-        cache[q.symbol].analysis = buildAnalysis(cache[q.symbol].prices, q);
-      }
-    });
+    await Promise.all(
+      watchlist.filter(s => cache[s]).map(async sym => {
+        const q = await fetchQuoteFH(sym);
+        cache[sym].quote = {
+          ...cache[sym].quote,
+          regularMarketPrice:         q.c,
+          regularMarketChange:        q.d,
+          regularMarketChangePercent: q.dp,
+        };
+        cache[sym].analysis = buildAnalysis(cache[sym].prices, cache[sym].quote);
+      })
+    );
     renderSidebar();
     if (active && cache[active]) {
       renderHeader(active);
@@ -902,8 +973,7 @@ function renderSidebar() {
         <div class="card-row-b">
           <div class="card-ticker">${sym}</div>
           <div class="card-change ${pos?'pos':'neg'}">${pos?'+':''}${q.regularMarketChangePercent.toFixed(2)}%</div>
-        </div>
-        <canvas class="mini-chart" id="mini-${sym}"></canvas>`;
+        </div>`;
     }
 
     card.addEventListener('click', e => {
@@ -911,8 +981,6 @@ function renderSidebar() {
       pick(sym);
     });
     el.appendChild(card);
-
-    if (d) setTimeout(() => drawMini(sym), 40);
   });
 
   // Remove buttons
@@ -924,27 +992,6 @@ function renderSidebar() {
   });
 }
 
-function drawMini(sym) {
-  const canvas = document.getElementById(`mini-${sym}`);
-  if (!canvas || !cache[sym]) return;
-  const prices = cache[sym].prices.slice(-21);
-  const pos = cache[sym].quote.regularMarketChange >= 0;
-  if (minis[sym]) { minis[sym].destroy(); delete minis[sym]; }
-  minis[sym] = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels: prices.map(() => ''),
-      datasets: [{ data: prices,
-        borderColor: pos ? '#22C55E' : '#EF4444', borderWidth: 1.5,
-        fill: true, backgroundColor: pos ? 'rgba(34,197,94,.07)' : 'rgba(239,68,68,.07)',
-        tension: 0.4, pointRadius: 0 }]
-    },
-    options: { responsive:true, maintainAspectRatio:false,
-      plugins:{ legend:{display:false}, tooltip:{enabled:false} },
-      scales:{ x:{display:false}, y:{display:false} },
-      animation:{duration:400} }
-  });
-}
 
 /* ═══════════════════════════════════════════════════════
    RENDER — MAIN
@@ -1069,14 +1116,14 @@ function renderNews(sym) {
     return;
   }
   el.innerHTML = news.map(n => {
-    const ago = timeAgo(n.providerPublishTime);
-    return `<a class="news-item" href="${n.link||'#'}" target="_blank" rel="noopener">
+    const ago = timeAgo(n.datetime); // Finnhub: datetime (Unix timestamp)
+    return `<a class="news-item" href="${n.url||'#'}" target="_blank" rel="noopener">
       <div class="news-meta">
-        <span class="news-src">${n.publisher||'—'}</span>
+        <span class="news-src">${n.source||'—'}</span>
         <span class="news-sep">·</span>
         <span class="news-time">${ago}</span>
       </div>
-      <div class="news-title">${n.title||''}</div>
+      <div class="news-title">${n.headline||''}</div>
     </a>`;
   }).join('');
 }
@@ -1206,7 +1253,6 @@ function removeFromWL(sym) {
   if (!confirm(`確定要從清單移除 ${sym}？`)) return;
   watchlist = watchlist.filter(s => s !== sym);
   saveWL();
-  if (minis[sym]) { minis[sym].destroy(); delete minis[sym]; }
 
   if (active === sym) {
     if (chart) { chart.destroy(); chart = null; }
@@ -1265,24 +1311,25 @@ function closeDropdown() {
 
 async function doSearch(q) {
   try {
-    const results = await searchYF(q);
+    const results = await searchFH(q);
     if (!results.length) {
       searchDropdown.innerHTML = '<div class="search-msg">找不到相關股票</div>';
       return;
     }
+    // Finnhub: { description, displaySymbol, symbol, type }
     searchDropdown.innerHTML = results.map(r => {
       const inList = watchlist.includes(r.symbol);
-      return `<div class="search-item" data-sym="${r.symbol}" data-name="${r.shortname||r.symbol}">
-        <span class="si-ticker">${r.symbol}</span>
-        <span class="si-name">${r.shortname || r.longname || '—'}</span>
-        <span class="si-exch">${r.exchange||''}</span>
+      return `<div class="search-item" data-sym="${r.symbol}" data-name="${r.description||r.symbol}">
+        <span class="si-ticker">${r.displaySymbol || r.symbol}</span>
+        <span class="si-name">${r.description || '—'}</span>
+        <span class="si-exch">${r.type||''}</span>
         <span class="si-added ${inList?'yes':'no'}">${inList?'已加入':'+ 加入'}</span>
       </div>`;
     }).join('');
 
     searchDropdown.querySelectorAll('.search-item').forEach(el => {
       el.addEventListener('click', () => {
-        const sym = el.dataset.sym;
+        const sym  = el.dataset.sym;
         const name = el.dataset.name;
         closeDropdown();
         searchInput.value = '';
