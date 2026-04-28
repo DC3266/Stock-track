@@ -817,9 +817,13 @@ const API_KEY     = 'd7if4d9r01qn2qatq0kgd7if4d9r01qn2qatq0l0';
 const POLYGON_KEY = 'e6Y9_mAsgFjrhOKU8Z_SajoEVFZbMM6O';
 const FH_BASE     = 'https://finnhub.io/api/v1';
 
-async function fh(path) {
+async function fh(path, retry = 3) {
   const sep = path.includes('?') ? '&' : '?';
   const r = await fetch(`${FH_BASE}${path}${sep}token=${API_KEY}`);
+  if (r.status === 429 && retry > 0) {
+    await new Promise(res => setTimeout(res, (4 - retry) * 1000));
+    return fh(path, retry - 1);
+  }
   if (!r.ok) throw new Error(`Finnhub ${r.status}: ${path}`);
   return await r.json();
 }
