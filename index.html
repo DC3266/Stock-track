@@ -813,8 +813,9 @@ function saveWL() { localStorage.setItem('sv_wl', JSON.stringify(watchlist)); }
 /* ═══════════════════════════════════════════════════════
    FINNHUB API
 ═══════════════════════════════════════════════════════ */
-const API_KEY = 'd7if4d9r01qn2qatq0kgd7if4d9r01qn2qatq0l0';
-const FH_BASE = 'https://finnhub.io/api/v1';
+const API_KEY     = 'd7if4d9r01qn2qatq0kgd7if4d9r01qn2qatq0l0';
+const POLYGON_KEY = 'e6Y9_mAsgFjrhOKU8Z_SajoEVFZbMM6O';
+const FH_BASE     = 'https://finnhub.io/api/v1';
 
 async function fh(path) {
   const sep = path.includes('?') ? '&' : '?';
@@ -842,23 +843,26 @@ async function fetchWithTimeout(url, ms = 7000) {
   } catch(e) { clearTimeout(id); throw e; }
 }
 
-function parseYahooChart(d) {
-  const res = d.chart?.result?.[0];
-  if (!res) return null;
-  const closes = res.indicators?.quote?.[0]?.close;
-  const stamps  = res.timestamp;
-  if (!closes?.length || !stamps?.length) return null;
-  const c = [], t = [], h = [], l = [], v = [];
-  closes.forEach((p, i) => {
-    if (p != null) {
-      c.push(+p.toFixed(2));
-      t.push(stamps[i]);
-      h.push(res.indicators.quote[0].high?.[i]   ?? p);
-      l.push(res.indicators.quote[0].low?.[i]    ?? p);
-      v.push(res.indicators.quote[0].volume?.[i] ?? 0);
-    }
-  });
-  return c.length ? { c, t, h, l, v, s: 'ok' } : null;
+async function fetchCandlesPolygon(symbol) {
+  const key = POLYGON_KEY;
+  try {
+    const to   = new Date().toISOString().split('T')[0];
+    const from = new Date(Date.now() - 366 * 24 * 3600 * 1000).toISOString().split('T')[0];
+    const url  = `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(symbol)}/range/1/day/${from}/${to}?adjusted=true&sort=asc&limit=365&apiKey=${key}`;
+    const r = await fetchWithTimeout(url, 15000);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (data.status !== 'OK' || !data.results?.length) return null;
+    const c = [], t = [], h = [], l = [], v = [];
+    data.results.forEach(bar => {
+      c.push(+bar.c.toFixed(2));
+      t.push(Math.floor(bar.t / 1000));
+      h.push(+bar.h.toFixed(2));
+      l.push(+bar.l.toFixed(2));
+      v.push(bar.v || 0);
+    });
+    return c.length ? { c, t, h, l, v, s: 'ok' } : null;
+  } catch { return null; }
 }
 
 async function fetchCandlesFinnhub(symbol) {
@@ -871,37 +875,11 @@ async function fetchCandlesFinnhub(symbol) {
   } catch { return null; }
 }
 
-async function fetchCandlesYahoo(symbol) {
-  const yUrl1 = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
-  const yUrl2 = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
-  const proxies = [
-    () => fetchWithTimeout(yUrl1),
-    () => fetchWithTimeout(`https://corsproxy.io/?${encodeURIComponent(yUrl1)}`),
-    () => fetchWithTimeout(`https://corsproxy.io/?${encodeURIComponent(yUrl2)}`),
-    () => fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(yUrl1)}`),
-    () => fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(yUrl2)}`),
-    () => fetchWithTimeout(`https://thingproxy.freeboard.io/fetch/${yUrl1}`),
-  ];
-  for (const attempt of proxies) {
-    try {
-      const r = await attempt();
-      if (!r.ok) continue;
-      const d = await r.json();
-      const result = parseYahooChart(d);
-      if (result) return result;
-    } catch {}
-  }
-  return null;
-}
-
 async function fetchCandles(symbol) {
-  // Try Finnhub first (uses existing API key, most reliable)
   const fhResult = await fetchCandlesFinnhub(symbol);
   if (fhResult) return fhResult;
-  // Fall back to Yahoo Finance via CORS proxies
-  const yhResult = await fetchCandlesYahoo(symbol);
-  if (yhResult) return yhResult;
-  // Return null instead of throwing — caller handles gracefully
+  const polyResult = await fetchCandlesPolygon(symbol);
+  if (polyResult) return polyResult;
   return null;
 }
 
@@ -1869,7 +1847,10 @@ function renderAISummaries() {
     const isLoading = text === '__loading__';
     const displayText = isLoading ? '正在分析中…' : (text || '無法取得摘要');
     return `<div class="ai-sum-block" style="border-left-color:${col}">
-      <span class="ai-sum-ticker" style="color:${col};border-color:${col}40;background:${col}18">${sym}</span>
+      <div class="ai-sum-header">
+        <span class="ai-sum-ticker" style="color:${col};border-color:${col}40;background:${col}18">${sym}</span>
+        <span class="ai-sum-label">AI 摘要</span>
+      </div>
       <p class="ai-sum-text${isLoading ? ' loading' : ''}">${displayText}</p>
     </div>`;
   }).join('');
