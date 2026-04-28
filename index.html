@@ -772,10 +772,20 @@ function parseYahooChart(d) {
   return c.length ? { c, t, h, l, v, s: 'ok' } : null;
 }
 
-async function fetchCandles(symbol) {
+async function fetchCandlesFinnhub(symbol) {
+  try {
+    const to   = Math.floor(Date.now() / 1000);
+    const from = to - 366 * 24 * 3600;
+    const d = await fh(`/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}`);
+    if (d.s !== 'ok' || !d.c?.length) return null;
+    return { c: d.c, t: d.t, h: d.h || d.c, l: d.l || d.c, v: d.v || d.c.map(()=>0), s: 'ok' };
+  } catch { return null; }
+}
+
+async function fetchCandlesYahoo(symbol) {
   const yUrl1 = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
   const yUrl2 = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1y`;
-  const attempts = [
+  const proxies = [
     () => fetchWithTimeout(yUrl1),
     () => fetchWithTimeout(`https://corsproxy.io/?${encodeURIComponent(yUrl1)}`),
     () => fetchWithTimeout(`https://corsproxy.io/?${encodeURIComponent(yUrl2)}`),
@@ -783,7 +793,7 @@ async function fetchCandles(symbol) {
     () => fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(yUrl2)}`),
     () => fetchWithTimeout(`https://thingproxy.freeboard.io/fetch/${yUrl1}`),
   ];
-  for (const attempt of attempts) {
+  for (const attempt of proxies) {
     try {
       const r = await attempt();
       if (!r.ok) continue;
@@ -792,7 +802,18 @@ async function fetchCandles(symbol) {
       if (result) return result;
     } catch {}
   }
-  throw new Error('無法取得歷史 K 線（所有代理均失敗）');
+  return null;
+}
+
+async function fetchCandles(symbol) {
+  // Try Finnhub first (uses existing API key, most reliable)
+  const fhResult = await fetchCandlesFinnhub(symbol);
+  if (fhResult) return fhResult;
+  // Fall back to Yahoo Finance via CORS proxies
+  const yhResult = await fetchCandlesYahoo(symbol);
+  if (yhResult) return yhResult;
+  // Return null instead of throwing — caller handles gracefully
+  return null;
 }
 
 async function fetchMetrics(symbol) {
@@ -1059,35 +1080,40 @@ async function loadStock(sym) {
     fetchNewsFH(sym),
   ]);
 
-  if (candles.s !== 'ok' || !candles.c?.length) throw new Error(`No candle data: ${sym}`);
+  // Require at least a valid quote price
+  if (!quoteFH?.c) throw new Error(`No quote data: ${sym}`);
 
-  const prices = candles.c.map(p => +p.toFixed(2));
-  const dates  = candles.t.map(t => new Date(t * 1000));
-  const lastVol = candles.v?.[candles.v.length - 1] || 0;
+  const hasCandles = candles?.s === 'ok' && candles.c?.length >= 2;
+  const prices = hasCandles ? candles.c.map(p => +p.toFixed(2)) : [quoteFH.pc, quoteFH.c].filter(Boolean);
+  const highs  = hasCandles ? candles.h : null;
+  const lows   = hasCandles ? candles.l : null;
+  const dates  = hasCandles ? candles.t.map(t => new Date(t * 1000)) : [new Date()];
+  const lastVol = candles?.v?.[candles.v.length - 1] || quoteFH.v || 0;
 
   const quote = {
     symbol:                    sym,
     shortName:                 profile.name || sym,
     regularMarketPrice:        quoteFH.c,
-    regularMarketChange:       quoteFH.d,
-    regularMarketChangePercent:quoteFH.dp,
+    regularMarketChange:       quoteFH.d  ?? 0,
+    regularMarketChangePercent:quoteFH.dp ?? 0,
     regularMarketVolume:       lastVol,
     marketCap:                 (profile.marketCapitalization || 0) * 1e6,
     trailingPE:                metrics['peTTM'] || metrics['peNormalizedAnnual'] || null,
-    fiftyTwoWeekHigh:          metrics['52WeekHigh'] || Math.max(...(candles.h || prices)),
-    fiftyTwoWeekLow:           metrics['52WeekLow']  || Math.min(...(candles.l || prices)),
+    fiftyTwoWeekHigh:          metrics['52WeekHigh'] || (hasCandles ? Math.max(...candles.h) : quoteFH.h) || quoteFH.c,
+    fiftyTwoWeekLow:           metrics['52WeekLow']  || (hasCandles ? Math.min(...candles.l) : quoteFH.l) || quoteFH.c,
     exchange:                  profile.exchange || '',
   };
 
   cache[sym] = {
     quote,
     prices,
-    highs: candles.h,
-    lows:  candles.l,
-    vols:  candles.v,
+    highs,
+    lows,
+    vols:  candles?.v || [],
     dates,
     news,
-    analysis: buildAnalysis(prices, quote, candles.h, candles.l),
+    noChart: !hasCandles,
+    analysis: buildAnalysis(prices, quote, highs, lows),
   };
 }
 
@@ -1417,6 +1443,22 @@ function renderNews() {
 function drawMainChart(sym, days) {
   const d = cache[sym];
   if (!d) return;
+
+  if (d.noChart || d.prices.length < 5) {
+    if (chart) { chart.destroy(); chart = null; }
+    const canvas = document.getElementById('priceChart');
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.font = '13px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('歷史 K 線暫時無法載入', canvas.width / 2, canvas.height / 2 - 10);
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.font = '11px Inter, sans-serif';
+    ctx.fillText('報價與技術指標仍正常顯示', canvas.width / 2, canvas.height / 2 + 14);
+    return;
+  }
+
   const prices = d.prices.slice(-days);
   const dates  = d.dates.slice(-days);
   const step   = Math.max(1, Math.floor(prices.length / 6));
