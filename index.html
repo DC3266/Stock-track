@@ -843,12 +843,19 @@ async function fetchWithTimeout(url, ms = 7000) {
   } catch(e) { clearTimeout(id); throw e; }
 }
 
-let _polyNext = 0;
+const CANDLE_TTL = 4 * 60 * 60 * 1000; // 4 小時快取
+
 async function fetchCandlesPolygon(symbol) {
+  // 先查 localStorage 快取，4 小時內直接使用，無需重打 API
+  try {
+    const raw = localStorage.getItem(`sv_candles_${symbol}`);
+    if (raw) {
+      const { data, ts } = JSON.parse(raw);
+      if (Date.now() - ts < CANDLE_TTL) return data;
+    }
+  } catch {}
+
   const key = POLYGON_KEY;
-  const wait = _polyNext - Date.now();
-  if (wait > 0) await new Promise(r => setTimeout(r, wait));
-  _polyNext = Date.now() + 13000; // 13s gap → max ~4.6 req/min, safely under 5
   try {
     const to   = new Date().toISOString().split('T')[0];
     const from = new Date(Date.now() - 366 * 24 * 3600 * 1000).toISOString().split('T')[0];
@@ -865,7 +872,12 @@ async function fetchCandlesPolygon(symbol) {
       l.push(+bar.l.toFixed(2));
       v.push(bar.v || 0);
     });
-    return c.length ? { c, t, h, l, v, s: 'ok' } : null;
+    const result = c.length ? { c, t, h, l, v, s: 'ok' } : null;
+    if (result) {
+      try { localStorage.setItem(`sv_candles_${symbol}`, JSON.stringify({ data: result, ts: Date.now() })); }
+      catch {} // localStorage 空間不足時靜默跳過
+    }
+    return result;
   } catch { return null; }
 }
 
