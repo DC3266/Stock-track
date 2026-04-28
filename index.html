@@ -843,8 +843,12 @@ async function fetchWithTimeout(url, ms = 7000) {
   } catch(e) { clearTimeout(id); throw e; }
 }
 
+let _polyNext = 0;
 async function fetchCandlesPolygon(symbol) {
   const key = POLYGON_KEY;
+  const wait = _polyNext - Date.now();
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  _polyNext = Date.now() + 13000; // 13s gap → max ~4.6 req/min, safely under 5
   try {
     const to   = new Date().toISOString().split('T')[0];
     const from = new Date(Date.now() - 366 * 24 * 3600 * 1000).toISOString().split('T')[0];
