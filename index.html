@@ -817,24 +817,45 @@ const API_KEY     = 'd7if4d9r01qn2qatq0kgd7if4d9r01qn2qatq0l0';
 const POLYGON_KEY = 'e6Y9_mAsgFjrhOKU8Z_SajoEVFZbMM6O';
 const FH_BASE     = 'https://finnhub.io/api/v1';
 
-async function fh(path, retry = 3) {
+async function fh(path) {
   const sep = path.includes('?') ? '&' : '?';
   const r = await fetch(`${FH_BASE}${path}${sep}token=${API_KEY}`);
-  if (r.status === 429 && retry > 0) {
-    await new Promise(res => setTimeout(res, (4 - retry) * 1000));
-    return fh(path, retry - 1);
-  }
   if (!r.ok) throw new Error(`Finnhub ${r.status}: ${path}`);
   return await r.json();
 }
 
-async function fetchQuoteFH(symbol) {
-  return await fh(`/quote?symbol=${symbol}`);
+/* ── 通用快取工具 ── */
+function getCache(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const { data, ts, ttl } = JSON.parse(raw);
+    return Date.now() - ts < ttl ? data : null;
+  } catch { return null; }
+}
+function setCache(key, data, ttl) {
+  try { localStorage.setItem(key, JSON.stringify({ data, ts: Date.now(), ttl })); }
+  catch {}
+}
+
+async function fetchQuoteFH(symbol, noCache = false) {
+  if (!noCache) {
+    const cached = getCache(`sv_q_${symbol}`);
+    if (cached) return cached;
+  }
+  const data = await fh(`/quote?symbol=${symbol}`);
+  setCache(`sv_q_${symbol}`, data, 60 * 1000); // 60 秒
+  return data;
 }
 
 async function fetchProfile(symbol) {
-  try { return await fh(`/stock/profile2?symbol=${symbol}`); }
-  catch { return {}; }
+  const cached = getCache(`sv_prof_${symbol}`);
+  if (cached) return cached;
+  try {
+    const data = await fh(`/stock/profile2?symbol=${symbol}`);
+    setCache(`sv_prof_${symbol}`, data, 24 * 60 * 60 * 1000); // 24 小時
+    return data;
+  } catch { return {}; }
 }
 
 async function fetchWithTimeout(url, ms = 7000) {
@@ -904,18 +925,26 @@ async function fetchCandles(symbol) {
 }
 
 async function fetchMetrics(symbol) {
+  const cached = getCache(`sv_met_${symbol}`);
+  if (cached) return cached;
   try {
     const d = await fh(`/stock/metric?symbol=${symbol}&metric=all`);
-    return d.metric || {};
+    const metric = d.metric || {};
+    setCache(`sv_met_${symbol}`, metric, 60 * 60 * 1000); // 1 小時
+    return metric;
   } catch { return {}; }
 }
 
 async function fetchNewsFH(symbol) {
+  const cached = getCache(`sv_news_${symbol}`);
+  if (cached) return cached;
   try {
     const to   = new Date().toISOString().split('T')[0];
     const from = new Date(Date.now() - 7*24*3600*1000).toISOString().split('T')[0];
     const d = await fh(`/company-news?symbol=${symbol}&from=${from}&to=${to}`);
-    return Array.isArray(d) ? d.slice(0, 8) : [];
+    const news = Array.isArray(d) ? d.slice(0, 8) : [];
+    setCache(`sv_news_${symbol}`, news, 15 * 60 * 1000); // 15 分鐘
+    return news;
   } catch { return []; }
 }
 
@@ -1228,7 +1257,7 @@ async function refreshQuotes() {
   try {
     await Promise.all(
       watchlist.filter(s => cache[s]).map(async sym => {
-        const q = await fetchQuoteFH(sym);
+        const q = await fetchQuoteFH(sym, true); // 繞過快取，取最新報價
         cache[sym].quote = {
           ...cache[sym].quote,
           regularMarketPrice:         q.c,
