@@ -852,7 +852,7 @@ async function fetchCandlesPolygon(symbol) {
     const r = await fetchWithTimeout(url, 15000);
     if (!r.ok) return null;
     const data = await r.json();
-    if (data.status !== 'OK' || !data.results?.length) return null;
+    if (!data.results?.length) return null;
     const c = [], t = [], h = [], l = [], v = [];
     data.results.forEach(bar => {
       c.push(+bar.c.toFixed(2));
